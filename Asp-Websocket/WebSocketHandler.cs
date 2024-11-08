@@ -10,7 +10,6 @@ public class WebSocketHandler
 
     public static async Task HandleChatSessionAsync(HttpContext context, WebSocket webSocket)
     {
-
         // Lấy userId và partnerId từ query parameters
         var userId = context.Request.Query["userId"].ToString();
         var partnerId = context.Request.Query["partnerId"].ToString();
@@ -29,9 +28,7 @@ public class WebSocketHandler
             return;
         }
 
-        // Nếu tất cả kiểm tra hợp lệ, tiến hành tạo session WebSocket
-        // (Thực hiện các bước khác trong quá trình thiết lập kết nối WebSocket của bạn ở đây)
-
+        // Tạo session WebSocket
         var sessionId = GenerateSessionId(userId, partnerId);
         _sessions.AddOrUpdate(sessionId, new List<WebSocket> { webSocket }, (key, existingList) =>
         {
@@ -50,12 +47,26 @@ public class WebSocketHandler
             foreach (var msg in previousMessages)
             {
                 var encodedMessage = Encoding.UTF8.GetBytes(msg.Content);
-                await webSocket.SendAsync(new ArraySegment<byte>(encodedMessage, 0, encodedMessage.Length), WebSocketMessageType.Text, true, CancellationToken.None);
+                if (webSocket.State == WebSocketState.Open)
+                {
+                    await webSocket.SendAsync(new ArraySegment<byte>(encodedMessage, 0, encodedMessage.Length),
+                        WebSocketMessageType.Text, true, CancellationToken.None);
+                }
             }
         }
 
         var buffer = new byte[1024 * 4];
-        WebSocketReceiveResult result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+        WebSocketReceiveResult result;
+
+        try
+        {
+            result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+        }
+        catch (WebSocketException ex)
+        {
+            Console.WriteLine($"WebSocket error during receive: {ex.Message}");
+            return;
+        }
 
         while (!result.CloseStatus.HasValue)
         {
@@ -82,14 +93,33 @@ public class WebSocketHandler
             {
                 if (socket != webSocket && socket.State == WebSocketState.Open)
                 {
-                    var encodedContent = Encoding.UTF8.GetBytes(content);
-                    await socket.SendAsync(new ArraySegment<byte>(encodedContent, 0, encodedContent.Length), result.MessageType, result.EndOfMessage, CancellationToken.None);
+                    try
+                    {
+                        var encodedContent = Encoding.UTF8.GetBytes(content);
+                        await socket.SendAsync(new ArraySegment<byte>(encodedContent, 0, encodedContent.Length),
+                            WebSocketMessageType.Text, true, CancellationToken.None);
+                    }
+                    catch (WebSocketException sendEx)
+                    {
+                        Console.WriteLine($"Failed to send message: {sendEx.Message}");
+                        // Handle the exception if needed, for instance by closing the socket
+                    }
                 }
             }
 
-            result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+            // Attempt to receive the next message
+            try
+            {
+                result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+            }
+            catch (WebSocketException ex)
+            {
+                Console.WriteLine($"WebSocket error during receive: {ex.Message}");
+                break;
+            }
         }
 
+        // Remove the WebSocket from the session on disconnection
         if (_sessions.TryGetValue(sessionId, out var webSocketList))
         {
             webSocketList.Remove(webSocket);
@@ -98,19 +128,25 @@ public class WebSocketHandler
                 _sessions.TryRemove(sessionId, out _);
             }
         }
-        await webSocket.CloseAsync(result.CloseStatus.Value, result.CloseStatusDescription, CancellationToken.None);
+        
+        // Close WebSocket connection gracefully
+        if (webSocket.State == WebSocketState.Open)
+        {
+            await webSocket.CloseAsync(result.CloseStatus.Value, result.CloseStatusDescription, CancellationToken.None);
+        }
     }
 
     // Phương thức để gửi thông báo lỗi và đóng kết nối
     private static async Task SendErrorMessageAndClose(WebSocket webSocket, string errorMessage)
     {
-        // Gửi tin nhắn lỗi đến client
-        var errorBuffer = Encoding.UTF8.GetBytes(errorMessage);
-        await webSocket.SendAsync(new ArraySegment<byte>(errorBuffer), WebSocketMessageType.Text, true, CancellationToken.None);
-
-        // Đóng kết nối với mã lỗi
-        await webSocket.CloseAsync(WebSocketCloseStatus.PolicyViolation, errorMessage, CancellationToken.None);
+        if (webSocket.State == WebSocketState.Open)
+        {
+            var errorBuffer = Encoding.UTF8.GetBytes(errorMessage);
+            await webSocket.SendAsync(new ArraySegment<byte>(errorBuffer), WebSocketMessageType.Text, true, CancellationToken.None);
+            await webSocket.CloseAsync(WebSocketCloseStatus.PolicyViolation, errorMessage, CancellationToken.None);
+        }
     }
+
     private static string GenerateSessionId(string userId, string partnerId)
     {
         return string.Compare(userId, partnerId) < 0 ? $"{userId}-{partnerId}" : $"{partnerId}-{userId}";
